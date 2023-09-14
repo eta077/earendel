@@ -3,7 +3,7 @@
 #![doc = include_str!("../README.md")]
 
 use astro_rs::coordinates::Icrs;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 
 use reqwest::header::HeaderMap;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
@@ -48,17 +48,6 @@ struct MastRequestParams {
     radius: f64,
 }
 
-impl MastRequestParams {
-    pub fn to_urlencoded(&self) -> String {
-        let result = [
-            ("ra", &self.ra.to_string()),
-            ("dec", &self.dec.to_string()),
-            ("radius", &self.radius.to_string()),
-        ];
-        serde_urlencoded::to_string(&result).unwrap()
-    }
-}
-
 impl From<Icrs> for MastRequestParams {
     fn from(value: Icrs) -> Self {
         MastRequestParams {
@@ -75,9 +64,9 @@ struct MastRequest {
     params: MastRequestParams,
     format: String,
     pagesize: usize,
+    page: usize,
     removenullcolumns: bool,
     timeout: u32,
-    cachebreaker: DateTime<Utc>,
 }
 
 impl MastRequest {
@@ -87,24 +76,16 @@ impl MastRequest {
             params,
             format: String::from("json"),
             pagesize: 25,
+            page: 1,
             removenullcolumns: true,
             timeout: 30,
-            cachebreaker: Utc::now(),
         }
     }
 
     pub fn to_urlencoded(&self) -> String {
-        let result = [
-            ("service", &self.service),
-            ("params", &self.params.to_urlencoded()),
-            ("format", &self.format),
-            ("pagesize", &self.pagesize.to_string()),
-            ("removenullcolumns", &self.removenullcolumns.to_string()),
-            ("timeout", &self.timeout.to_string()),
-            ("cachebreaker", &self.cachebreaker.to_string()),
-        ];
+        let result = serde_json::to_string(self).unwrap();
 
-        serde_urlencoded::to_string(&result).unwrap()
+        urlencoding::encode(&result).into_owned()
     }
 }
 
@@ -164,18 +145,12 @@ impl EarendelServer {
     #[instrument(skip(self))]
     pub async fn get_fits_for_apod(&self) -> Result<(), Box<dyn Error>> {
         let api_url = "https://mast.stsci.edu/api/v0/invoke";
-        let api_key = env::var("EARENDEL_MAST_API_KEY")?;
 
         let coords = astro_rs::coordinates::lookup_by_name("NGC 1566").await?;
 
         let params = MastRequestParams::from(coords);
         let request = MastRequest::new(params);
-
-        println!("{request:?}");
-        //let encoded_request = ["request=", &request.to_urlencoded()].concat();
-        let encoded_request =
-            serde_urlencoded::to_string(&[("request", request.to_urlencoded())]).unwrap();
-        println!("encoded request: {:?}", encoded_request);
+        let encoded_request = ["request=", &request.to_urlencoded()].concat();
 
         let client = reqwest::Client::new();
 
@@ -187,13 +162,11 @@ impl EarendelServer {
         headers.insert(ACCEPT, "text/plain".parse().unwrap());
 
         let resp = client
-            .get(api_url)
+            .post(api_url)
             .headers(headers)
             .body(encoded_request)
             .send()
             .await?;
-
-        println!("response: {resp:?}");
 
         let body = resp.text().await?;
 
