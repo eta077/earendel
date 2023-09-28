@@ -19,13 +19,24 @@ use std::error::Error;
 
 /// Information used to display the APOD.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct EarendelState {
+pub struct EarendelApod {
     /// The title of the APOD.
     pub title: String,
     /// The binary representation of the image.
     pub img: Vec<u8>,
     /// The copyright string.
     pub copyright: Option<String>,
+}
+
+/// Information used to display FITS files available for the APOD.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EarendelFits {
+    /// The names of the FITS files for the current page.
+    pub files: Vec<String>,
+    /// The current page number.
+    pub page: usize,
+    /// The total number of available FITS files.
+    pub total_hits: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -41,7 +52,7 @@ struct Apod {
     url: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 struct MastRequestParams {
     ra: f64,
     dec: f64,
@@ -58,7 +69,7 @@ impl From<Icrs> for MastRequestParams {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 struct MastRequest {
     service: String,
     params: MastRequestParams,
@@ -70,13 +81,13 @@ struct MastRequest {
 }
 
 impl MastRequest {
-    pub fn new(params: MastRequestParams) -> Self {
+    pub fn new(params: MastRequestParams, page: usize) -> Self {
         MastRequest {
             service: String::from("Mast.Caom.Cone"),
             params,
             format: String::from("json"),
             pagesize: 25,
-            page: 1,
+            page,
             removenullcolumns: true,
             timeout: 30,
         }
@@ -89,10 +100,76 @@ impl MastRequest {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct MastResponse {
+    status: String,
+    msg: String,
+    data: Vec<MastResponseEntry>,
+    paging: MastResponsePaging,
+}
+
+#[derive(Debug, Deserialize)]
+struct MastResponseEntry {
+    #[serde(rename = "intentType")]
+    intent_type: Option<String>,
+    obs_collection: Option<String>,
+    provenance_name: Option<String>,
+    instrument_name: Option<String>,
+    project: Option<String>,
+    filters: Option<String>,
+    wavelength_region: Option<String>,
+    target_name: Option<String>,
+    target_classification: Option<String>,
+    obs_id: Option<String>,
+    s_ra: Option<f64>,
+    s_dec: Option<f64>,
+    dataproduct_type: Option<String>,
+    proposal_pi: Option<String>,
+    calib_level: Option<i64>,
+    t_min: Option<f64>,
+    t_max: Option<f64>,
+    t_exptime: Option<f64>,
+    em_min: Option<f64>,
+    em_max: Option<f64>,
+    obs_title: Option<String>,
+    t_obs_release: Option<f64>,
+    proposal_id: Option<String>,
+    proposal_type: Option<String>,
+    sequence_number: Option<i64>,
+    s_region: Option<String>,
+    #[serde(rename = "jpegURL")]
+    jpeg_url: Option<String>,
+    #[serde(rename = "dataURL")]
+    data_url: Option<String>,
+    #[serde(rename = "dataRights")]
+    data_rights: Option<String>,
+    #[serde(rename = "mtFlag")]
+    mt_flag: Option<bool>,
+    #[serde(rename = "srcDen")]
+    src_den: Option<f64>,
+    distance: Option<f64>,
+    #[serde(rename = "_selected_")]
+    selected: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MastResponsePaging {
+    page: usize,
+    #[serde(rename = "pageSize")]
+    page_size: usize,
+    #[serde(rename = "pagesFiltered")]
+    pages_filtered: usize,
+    rows: usize,
+    #[serde(rename = "rowsFiltered")]
+    rows_filtered: usize,
+    #[serde(rename = "rowsTotal")]
+    rows_total: usize,
+}
+
 /// The manager of the Earendel functionality and state.
 #[derive(Default)]
 pub struct EarendelServer {
-    cached_state: Option<(NaiveDate, EarendelState)>,
+    cached_state: Option<(NaiveDate, EarendelApod)>,
 }
 
 impl EarendelServer {
@@ -102,7 +179,7 @@ impl EarendelServer {
     }
 
     /// Gets the current APOD image data. Returns an Error if the web request fails or if deserialization fails.
-    pub async fn get_apod_image(&mut self) -> Result<EarendelState, Box<dyn Error>> {
+    pub async fn get_apod_image(&mut self) -> Result<EarendelApod, Box<dyn Error>> {
         let today = Utc::now().date_naive();
         let new_state = match self.cached_state.as_ref() {
             Some((date, apod)) if date == &today => apod.to_owned(),
@@ -113,7 +190,7 @@ impl EarendelServer {
         Ok(new_state)
     }
 
-    async fn fetch_apod_image() -> Result<EarendelState, Box<dyn Error>> {
+    async fn fetch_apod_image() -> Result<EarendelApod, Box<dyn Error>> {
         let api_url = "https://api.nasa.gov/planetary/apod";
         let api_key = env::var("EARENDEL_APOD_API_KEY")?;
         let request_url = [api_url, "?api_key=", &api_key].concat();
@@ -125,7 +202,7 @@ impl EarendelServer {
         let resp = reqwest::get(apod.url.ok_or("APOD did not contain image URL")?).await?;
         let img = resp.bytes().await?;
 
-        Ok(EarendelState {
+        Ok(EarendelApod {
             title: apod.title,
             img: img.to_vec(),
             copyright: apod.copyright,
@@ -143,13 +220,16 @@ impl EarendelServer {
     /// # });
     /// ```
     #[instrument(skip(self))]
-    pub async fn get_fits_for_apod(&self) -> Result<(), Box<dyn Error>> {
+    pub async fn get_fits_for_apod(&mut self, page: usize) -> Result<EarendelFits, Box<dyn Error>> {
+        let apod = self.get_apod_image().await?;
+        // TODO: extract name from apod title
+        let name = "NGC 4632";
         let api_url = "https://mast.stsci.edu/api/v0/invoke";
 
-        let coords = astro_rs::coordinates::lookup_by_name("NGC 1566").await?;
+        let coords = astro_rs::coordinates::lookup_by_name(name).await?;
 
         let params = MastRequestParams::from(coords);
-        let request = MastRequest::new(params);
+        let request = MastRequest::new(params, page);
         let encoded_request = ["request=", &request.to_urlencoded()].concat();
 
         let client = reqwest::Client::new();
@@ -167,11 +247,27 @@ impl EarendelServer {
             .body(encoded_request)
             .send()
             .await?;
-
         let body = resp.text().await?;
+        let mast = serde_json::from_str::<MastResponse>(&body)?;
 
-        println!("body: {body}");
+        let fits_files = mast
+            .data
+            .iter()
+            .filter_map(|entry| {
+                entry.data_url.as_ref().and_then(|file| {
+                    if file.contains("fits") {
+                        Some(file.to_owned())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<Vec<String>>();
 
-        Ok(())
+        Ok(EarendelFits {
+            files: fits_files,
+            page,
+            total_hits: mast.paging.rows_total,
+        })
     }
 }
